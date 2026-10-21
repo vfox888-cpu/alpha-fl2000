@@ -35,12 +35,12 @@
 
 static unsigned int max_mbytes;
 module_param(max_mbytes, uint, 0444);
-MODULE_PARM_DESC(max_mbytes, "Предел полосы USB для видео, МБ/с (0 = по скорости порта)");
+MODULE_PARM_DESC(max_mbytes, "USB bandwidth budget for video, MB/s (0 = derive from link speed)");
 
 /* 1080p XRGB = 8 МБ на буфер; GNOME держит 3–4 таких + консоль, так что 128 МБ — с запасом. */
 static unsigned int max_mem_mb = 128;
 module_param(max_mem_mb, uint, 0444);
-MODULE_PARM_DESC(max_mem_mb, "Потолок ОЗУ под буферы кадров, МБ (0 = без потолка)");
+MODULE_PARM_DESC(max_mem_mb, "Cap on RAM used by framebuffers, MB (0 = no cap)");
 
 #define FL_VID 0x1d5c
 #define FL_PID 0x2000
@@ -1274,7 +1274,7 @@ DEFINE_DRM_GEM_FOPS(fl_fops);
  */
 static bool no_foreign_import;
 module_param(no_foreign_import, bool, 0444);
-MODULE_PARM_DESC(no_foreign_import, "Не принимать буферы чужих видеокарт (плавнее, но на mutter 50 ведёт к OOM)");
+MODULE_PARM_DESC(no_foreign_import, "Refuse dma-buf imports from other GPUs (smoother, but triggers OOM with mutter 50)");
 
 static struct drm_gem_object *fl_prime_import(struct drm_device *dev, struct dma_buf *buf)
 {

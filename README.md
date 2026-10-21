@@ -68,33 +68,62 @@ make
 Needs the kernel headers for the running kernel (`KDIR` defaults to
 `/lib/modules/$(uname -r)/build`).
 
-## Load
+## Install (autoload at boot)
 
 ```sh
-sudo modprobe drm_kms_helper drm_shmem_helper drm_client_lib
-sudo insmod src/alpha_fl2000.ko
+make -C src
+sudo bash install-autoload.sh          # uninstall: sudo bash install-autoload.sh --remove
+sudo reboot
 ```
 
-Optional module parameter:
+The installer copies the module to `/lib/modules/$(uname -r)/updates/`, runs
+`depmod`, and installs:
 
-- `max_mbytes` — cap the USB bandwidth budget used for video, in MB/s
-  (default: 80% of the negotiated USB link speed). Useful for throttling
-  down to RGB565 on a slow/shared bus.
+- [`modprobe/alpha-fl2000.conf`](modprobe/alpha-fl2000.conf) — keeps
+  `usb-storage` off the adapter's built-in 8 MB flash drive (polling it caused
+  USB resets);
+- [`udev/71-fl2000-no-storage.rules`](udev/71-fl2000-no-storage.rules) — same,
+  for the case where `usb-storage` is loaded from the initramfs.
 
-A udev rule granting non-root access to the device is in
-[`udev/70-fl2000.rules`](udev/70-fl2000.rules) — copy it to
-`/etc/udev/rules.d/` if you need the device node writable without root.
+udev then loads the driver whenever the adapter is present, before the
+desktop starts. Loading it *before* GNOME matters: mutter handles a GPU that
+appears at startup much better than one hot-added into a running session.
+
+After a kernel update the module must be rebuilt and reinstalled (no DKMS yet).
+If a broken build ever prevents booting, add `module_blacklist=alpha_fl2000`
+to the kernel command line in GRUB.
+
+Manual one-off load for testing: `sudo insmod src/alpha_fl2000.ko`.
+
+### Module parameters
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `max_mbytes` | 0 (from link speed) | USB bandwidth budget for video, MB/s; low values force RGB565 |
+| `max_mem_mb` | 128 | Cap on RAM used by dumb framebuffers (0 = no cap) |
+| `no_foreign_import` | off | Refuse dma-buf imports from other GPUs. Smoother, but with mutter 50 on AMD closing the laptop lid made mutter allocate ~3 GB of VRAM/GTT and run the system out of memory — leave off |
+
+### Diagnostics
+
+- `/sys/bus/usb/drivers/alpha_fl2000/*/status` (root) — link, bridge lock
+  (`vid_stable`), HPD, frame counters, slow/unaligned row reads.
+- `/sys/bus/usb/drivers/alpha_fl2000/*/mem` — framebuffer memory in use / peak / cap.
+- Updates slower than 30 ms are logged to `dmesg`.
+
+Log messages and code comments are partly in Russian.
 
 ## Status
 
-Working: 1920×1080@60 RGB888 over USB3 on bare metal, extends the desktop as
-a second monitor under GNOME, hardware cursor, EDID autodetect, damage-clip
-partial updates (~5 ms/full-frame conversion on the reference host).
+Working on the reference host (Ryzen 7 laptop, AMD iGPU, Ubuntu, kernel 7.0,
+GNOME 50 / Wayland): 1920×1080@60 RGB888 over USB3, extends the desktop next
+to the laptop's own HDMI output, hardware cursor plane, EDID autodetect,
+damage-clip partial updates with 16-byte-aligned streaming reads from
+imported GPU buffers (~2–5 ms per full frame), survives USB resets without
+re-creating the DRM device, retries the HDMI bridge lock, forces a hotplug
+event once HPD rises so the compositor picks the monitor up.
 
-Under investigation: the connector is occasionally not picked up by the
-compositor again after an unrelated compositor restart (e.g. gnome-shell
-being killed and respawned by the OOM killer) — looks like stale DRM-master
-state on the compositor side rather than a driver bug, not yet root-caused.
+Not done yet: DKMS packaging, audio, modes above 1080p60, E-DDC (EDID beyond
+two blocks).
 
 ## Credits / references
 
