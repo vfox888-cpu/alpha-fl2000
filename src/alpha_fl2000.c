@@ -37,6 +37,11 @@ static unsigned int max_mbytes;
 module_param(max_mbytes, uint, 0444);
 MODULE_PARM_DESC(max_mbytes, "Предел полосы USB для видео, МБ/с (0 = по скорости порта)");
 
+/* 1080p XRGB = 8 МБ на буфер; GNOME держит 3–4 таких + консоль, так что 128 МБ — с запасом. */
+static unsigned int max_mem_mb = 128;
+module_param(max_mem_mb, uint, 0444);
+MODULE_PARM_DESC(max_mem_mb, "Потолок ОЗУ под буферы кадров, МБ (0 = без потолка)");
+
 #define FL_VID 0x1d5c
 #define FL_PID 0x2000
 #define FL_IF_AVCONTROL 0
@@ -169,6 +174,16 @@ struct alpha_fl {
 	unsigned int wire_bpp;
 	unsigned int lock_retries;
 
+	/*
+	 * При регистрации устройства GNOME/Mutter опрашивает коннектор один раз. Если в этот
+	 * момент HPD от моста ещё не успел подняться, статус "подключено" навсегда остаётся
+	 * незамеченным — поллинг drm_kms_helper шлёт хотплаг только при ИЗМЕНЕНИИ статуса, а
+	 * тут изменения с точки зрения ядра не было. Поэтому явно перепроверяем и один раз
+	 * форсируем drm_kms_helper_hotplug_event(), когда HPD реально встал.
+	 */
+	struct delayed_work hpd_announce_work;
+	unsigned int hpd_announce_retries;
+
 	/* Кадр в «проводном» формате FL2000, крутится по кругу в NUM_URBS передачах. */
 	u8 *frame;
 	size_t frame_size;
@@ -197,6 +212,12 @@ struct alpha_fl {
 		u64 last_updates, last_pixels, last_ns, last_ns_access, last_t;
 		bool imported;
 	} st;
+
+	/* ОЗУ под наши GEM-буферы — без потолка утечка в GNOME доводила машину до OOM. */
+	struct {
+		atomic64_t bytes, peak;
+		atomic_t objects, refused;
+	} mem;
 };
 
 #define to_fl(d) container_of(d, struct alpha_fl, drm)
@@ -975,6 +996,9 @@ static int fl_crtc_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 #define FL_LOCK_RETRIES  3
 #define FL_LOCK_CHECK_MS 300
 
+#define FL_HPD_ANNOUNCE_RETRIES 20
+#define FL_HPD_ANNOUNCE_MS      100
+
 /*
  * Настроить PLL/таймингb и поднять поток, затем включить TMDS-выход моста.
  * @ps — состояние основной плоскости для первого кадра; NULL при повторной
@@ -1044,6 +1068,31 @@ static void fl_lock_check(struct work_struct *work)
 	}
 	schedule_delayed_work(&fl->lock_work, msecs_to_jiffies(FL_LOCK_CHECK_MS));
 out:
+	drm_dev_exit(idx);
+}
+
+/*
+ * Сразу после drm_dev_register() ждём, пока IT66121 реально поднимет HPD, и как только
+ * это случилось — форсируем хотплаг-событие, чтобы Mutter, уже один раз (неудачно)
+ * опросивший коннектор при добавлении карты, перечитал его состояние заново.
+ */
+static void fl_hpd_announce(struct work_struct *work)
+{
+	struct alpha_fl *fl = container_of(to_delayed_work(work), struct alpha_fl, hpd_announce_work);
+	int idx;
+	u8 sys = 0;
+
+	if (!drm_dev_enter(&fl->drm, &idx))
+		return;
+	if (!it_read8(fl, IT_SYS_STATUS, &sys) && (sys & IT_HPD)) {
+		drm_dbg_kms(&fl->drm, "HPD поднялся, сообщаю об изменении статуса коннектора\n");
+		drm_kms_helper_hotplug_event(&fl->drm);
+	} else if (fl->hpd_announce_retries < FL_HPD_ANNOUNCE_RETRIES) {
+		fl->hpd_announce_retries++;
+		schedule_delayed_work(&fl->hpd_announce_work, msecs_to_jiffies(FL_HPD_ANNOUNCE_MS));
+	} else {
+		drm_dbg_kms(&fl->drm, "HPD не поднялся за отведённое время, оповещение не послано\n");
+	}
 	drm_dev_exit(idx);
 }
 
@@ -1179,22 +1228,103 @@ static const struct drm_mode_config_funcs fl_mode_config_funcs = {
 DEFINE_DRM_GEM_FOPS(fl_fops);
 
 /*
- * Чужие буферы (из видеопамяти AMD) не принимаем: процессор читает их в 30–40 раз медленнее
- * обычной памяти, отсюда рывки. Получив отказ, GNOME сам копирует кадр силами видеокарты
- * в наш буфер в ОЗУ. Свои экспортированные буферы принимаем как обычно.
+ * Чужие буферы (из видеопамяти AMD) процессор читает в 30–40 раз медленнее, отсюда рывки.
+ * Отказ в импорте заставляет GNOME копировать кадр самому, но на mutter 50 с этим
+ * обходом память AMD за минуту дорастала до 3.4 ГБ и машина уходила в OOM — поэтому
+ * по умолчанию импорт разрешён.
  */
+static bool no_foreign_import;
+module_param(no_foreign_import, bool, 0444);
+MODULE_PARM_DESC(no_foreign_import, "Не принимать буферы чужих видеокарт (плавнее, но на mutter 50 ведёт к OOM)");
+
 static struct drm_gem_object *fl_prime_import(struct drm_device *dev, struct dma_buf *buf)
 {
-	if (drm_gem_is_prime_exported_dma_buf(dev, buf))
-		return drm_gem_shmem_prime_import_no_map(dev, buf);
-	return ERR_PTR(-EOPNOTSUPP);
+	if (no_foreign_import && !drm_gem_is_prime_exported_dma_buf(dev, buf))
+		return ERR_PTR(-EOPNOTSUPP);
+	return drm_gem_shmem_prime_import_no_map(dev, buf);
+}
+
+/* base первым: drm_gem_shmem_free() делает kfree() по указателю на shmem-объект. */
+struct fl_bo {
+	struct drm_gem_shmem_object base;
+	bool counted;
+};
+
+static void fl_gem_free(struct drm_gem_object *obj)
+{
+	struct fl_bo *bo = container_of(obj, struct fl_bo, base.base);
+	struct alpha_fl *fl = to_fl(obj->dev);
+
+	if (bo->counted) {
+		atomic64_sub(obj->size, &fl->mem.bytes);
+		atomic_dec(&fl->mem.objects);
+	}
+	drm_gem_shmem_object_free(obj);
+}
+
+static const struct drm_gem_object_funcs fl_gem_funcs = {
+	.free = fl_gem_free,
+	.print_info = drm_gem_shmem_object_print_info,
+	.pin = drm_gem_shmem_object_pin,
+	.unpin = drm_gem_shmem_object_unpin,
+	.get_sg_table = drm_gem_shmem_object_get_sg_table,
+	.vmap = drm_gem_shmem_object_vmap,
+	.vunmap = drm_gem_shmem_object_vunmap,
+	.mmap = drm_gem_shmem_object_mmap,
+	.vm_ops = &drm_gem_shmem_vm_ops,
+};
+
+static struct drm_gem_object *fl_gem_create_object(struct drm_device *dev, size_t size)
+{
+	struct alpha_fl *fl = to_fl(dev);
+	u64 limit = (u64)max_mem_mb << 20;
+	struct fl_bo *bo;
+
+	if (limit && atomic64_read(&fl->mem.bytes) + size > limit) {
+		atomic_inc(&fl->mem.refused);
+		drm_err_ratelimited(dev, "потолок %u МБ: отказ в буфере %zu КБ (занято %lld КБ в %d буферах)\n",
+				    max_mem_mb, size >> 10, atomic64_read(&fl->mem.bytes) >> 10,
+				    atomic_read(&fl->mem.objects));
+		return ERR_PTR(-ENOMEM);
+	}
+	bo = kzalloc(sizeof(*bo), GFP_KERNEL);
+	if (!bo)
+		return ERR_PTR(-ENOMEM);
+	bo->base.base.funcs = &fl_gem_funcs;
+	return &bo->base.base;
+}
+
+/* Учитываем только успешно созданный буфер: ошибки внутри shmem-хелпера освобождают его в обход .free. */
+static int fl_dumb_create(struct drm_file *file, struct drm_device *dev,
+			  struct drm_mode_create_dumb *args)
+{
+	struct alpha_fl *fl = to_fl(dev);
+	struct drm_gem_object *obj;
+	s64 now, peak;
+	int ret;
+
+	ret = drm_gem_shmem_dumb_create(file, dev, args);
+	if (ret)
+		return ret;
+	obj = drm_gem_object_lookup(file, args->handle);
+	if (!obj)
+		return 0;
+	container_of(obj, struct fl_bo, base.base)->counted = true;
+	atomic_inc(&fl->mem.objects);
+	now = atomic64_add_return(obj->size, &fl->mem.bytes);
+	peak = atomic64_read(&fl->mem.peak);
+	while (now > peak && !atomic64_try_cmpxchg(&fl->mem.peak, &peak, now))
+		;
+	drm_gem_object_put(obj);
+	return 0;
 }
 
 static const struct drm_driver fl_drm_driver = {
 	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
 	.fops = &fl_fops,
+	.gem_create_object = fl_gem_create_object,
 	.gem_prime_import = fl_prime_import,
-	.dumb_create = drm_gem_shmem_dumb_create,
+	.dumb_create = fl_dumb_create,
 	DRM_FBDEV_SHMEM_DRIVER_OPS,
 	.name = "alpha_fl2000",
 	.desc = "Alpha FL2000 USB display",
@@ -1302,6 +1432,17 @@ static ssize_t status_show(struct device *dev, struct device_attribute *attr, ch
 /* Координаты курсора и частота апдейтов — диагностика, не для всех локальных пользователей. */
 static DEVICE_ATTR(status, 0400, status_show, NULL);
 
+static ssize_t mem_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct alpha_fl *fl = usb_get_intfdata(to_usb_interface(dev));
+
+	return sysfs_emit(buf, "буферов %d, занято %lld КБ, пик %lld КБ, потолок %u МБ, отказов %d\n",
+			  atomic_read(&fl->mem.objects), atomic64_read(&fl->mem.bytes) >> 10,
+			  atomic64_read(&fl->mem.peak) >> 10, max_mem_mb,
+			  atomic_read(&fl->mem.refused));
+}
+static DEVICE_ATTR_RO(mem);
+
 /* ---------------- USB ---------------- */
 
 static int alpha_fl_probe(struct usb_interface *intf, const struct usb_device_id *id)
@@ -1321,6 +1462,7 @@ static int alpha_fl_probe(struct usb_interface *intf, const struct usb_device_id
 	if (ret)
 		return ret;
 	INIT_DELAYED_WORK(&fl->lock_work, fl_lock_check);
+	INIT_DELAYED_WORK(&fl->hpd_announce_work, fl_hpd_announce);
 	if (max_mbytes)
 		fl->max_bw = (u64)max_mbytes * 1000000;
 	else if (udev->speed >= USB_SPEED_SUPER)
@@ -1354,16 +1496,23 @@ static int alpha_fl_probe(struct usb_interface *intf, const struct usb_device_id
 	ret = device_create_file(&intf->dev, &dev_attr_status);
 	if (ret)
 		return ret;
+	ret = device_create_file(&intf->dev, &dev_attr_mem);
+	if (ret) {
+		device_remove_file(&intf->dev, &dev_attr_status);
+		return ret;
+	}
 	drm_kms_helper_poll_init(&fl->drm);
 	ret = drm_dev_register(&fl->drm, 0);
 	if (ret) {
 		drm_kms_helper_poll_fini(&fl->drm);
+		device_remove_file(&intf->dev, &dev_attr_mem);
 		device_remove_file(&intf->dev, &dev_attr_status);
 		return ret;
 	}
 	drm_info(&fl->drm, "FL2000 (%s), IT66121 @0x%02x, полоса %llu МБ/с\n",
 		 usb_speed_string(udev->speed), fl->bridge, div_u64(fl->max_bw, 1000000));
 	drm_client_setup_with_fourcc(&fl->drm, DRM_FORMAT_XRGB8888);
+	schedule_delayed_work(&fl->hpd_announce_work, msecs_to_jiffies(FL_HPD_ANNOUNCE_MS));
 	return 0;
 }
 
@@ -1371,6 +1520,8 @@ static void alpha_fl_disconnect(struct usb_interface *intf)
 {
 	struct alpha_fl *fl = usb_get_intfdata(intf);
 
+	cancel_delayed_work_sync(&fl->hpd_announce_work);
+	device_remove_file(&intf->dev, &dev_attr_mem);
 	device_remove_file(&intf->dev, &dev_attr_status);
 	drm_kms_helper_poll_fini(&fl->drm);
 	drm_dev_unplug(&fl->drm);
