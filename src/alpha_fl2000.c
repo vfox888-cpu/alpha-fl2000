@@ -1228,7 +1228,8 @@ static ssize_t status_show(struct device *dev, struct device_attribute *attr, ch
 		atomic_read(&fl->streaming), fl->width, fl->height, fl->bpp);
 	}
 }
-static DEVICE_ATTR_RO(status);
+/* Координаты курсора и частота апдейтов — диагностика, не для всех локальных пользователей. */
+static DEVICE_ATTR(status, 0400, status_show, NULL);
 
 /* ---------------- USB ---------------- */
 
@@ -1285,6 +1286,7 @@ static int alpha_fl_probe(struct usb_interface *intf, const struct usb_device_id
 	ret = drm_dev_register(&fl->drm, 0);
 	if (ret) {
 		drm_kms_helper_poll_fini(&fl->drm);
+		device_remove_file(&intf->dev, &dev_attr_status);
 		return ret;
 	}
 	drm_info(&fl->drm, "FL2000 (%s), IT66121 @0x%02x, полоса %llu МБ/с\n",
