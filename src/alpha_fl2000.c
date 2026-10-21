@@ -214,7 +214,7 @@ struct alpha_fl {
 
 	/* Замеры обновлений кадра; «last_*» — снимок на момент прошлого чтения status. */
 	struct {
-		u64 updates, full, pixels, ns, ns_access, ns_max;
+		u64 updates, full, pixels, ns, ns_access, ns_max, rows, slow_rows;
 		u64 last_updates, last_pixels, last_ns, last_ns_access, last_t;
 		bool imported;
 	} st;
@@ -774,11 +774,16 @@ static void fl_blit(struct alpha_fl *fl, const struct drm_plane_state *ps,
 	const struct drm_framebuffer *fb = ps->fb;
 	int sx = ps->src.x1 >> 16, sy = ps->src.y1 >> 16;
 	int dx = ps->dst.x1, dy = ps->dst.y1;
+	/*
+	 * drm_memcpy_from_wc читает потоково (movntdqa) только при выравнивании на 16 байт,
+	 * иначе молча берёт memcpy — из памяти AMD это ~70 мс на кадр вместо ~2 мс.
+	 */
+	int x1 = round_down(clip->x1, 4), x2 = min_t(int, round_up(clip->x2, 4), fb->width);
 	int y;
 
 	for (y = clip->y1; y < clip->y2; y++) {
-		int ty = y - sy + dy, x = max(clip->x1, sx - dx);
-		int n = min(clip->x2, (int)fl->width + sx - dx) - x;
+		int ty = y - sy + dy, x = max(x1, sx - dx);
+		int n = min(x2, (int)fl->width + sx - dx) - x;
 		struct iosys_map d, sm = *map;
 
 		if (ty < 0 || ty >= fl->height || n <= 0)
@@ -786,10 +791,13 @@ static void fl_blit(struct alpha_fl *fl, const struct drm_plane_state *ps,
 		/* Буфер часто лежит в памяти видеокарты (WC) — читаем широкими загрузками. */
 		iosys_map_set_vaddr(&d, fl->mirror + (size_t)ty * fl->width + (x - sx + dx));
 		iosys_map_incr(&sm, (size_t)y * fb->pitches[0] + (size_t)x * 4);
+		fl->st.rows++;
+		if (((uintptr_t)d.vaddr | (uintptr_t)sm.vaddr | (n * 4)) & 15)
+			fl->st.slow_rows++;
 		drm_memcpy_from_wc(&d, &sm, (unsigned long)n * 4);
 	}
-	fl_render(fl, DRM_RECT_INIT(clip->x1 - sx + dx, clip->y1 - sy + dy,
-				    drm_rect_width(clip), drm_rect_height(clip)));
+	fl_render(fl, DRM_RECT_INIT(x1 - sx + dx, clip->y1 - sy + dy,
+				    x2 - x1, drm_rect_height(clip)));
 }
 
 static u64 fl_copy_plane(struct alpha_fl *fl, struct drm_plane_state *old,
@@ -1438,11 +1446,13 @@ static ssize_t status_show(struct device *dev, struct device_attribute *attr, ch
 		int len = sysfs_emit(buf,
 			"обновлений %llu (полных %llu), буфер из видеокарты %d, курсор %d %d,%d\n"
 			"за %llu мс: %llu обн/с, в среднем %llu пикс/обн, %llu мкс/обн "
-			"(доступ %llu мкс), максимум %llu мкс\n",
+			"(доступ %llu мкс), максимум %llu мкс\n"
+			"строк прочитано %llu, из них без выравнивания (медленно) %llu\n",
 			fl->st.updates, fl->st.full, fl->st.imported, fl->cur.on, fl->cur.x, fl->cur.y,
 			div_u64(dt, 1000000), dt ? div64_u64(du * 1000000000ULL, dt) : 0,
 			du ? div64_u64(dp, du) : 0, du ? div64_u64(dns, du * 1000) : 0,
-			du ? div64_u64(dacc, du * 1000) : 0, div_u64(fl->st.ns_max, 1000));
+			du ? div64_u64(dacc, du * 1000) : 0, div_u64(fl->st.ns_max, 1000),
+			fl->st.rows, fl->st.slow_rows);
 
 		fl->st.last_t = now;
 		fl->st.last_updates = fl->st.updates;
