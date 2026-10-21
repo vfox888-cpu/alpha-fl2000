@@ -11,6 +11,7 @@
 #include <linux/unaligned.h>
 #include <linux/usb.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -115,6 +116,8 @@ MODULE_PARM_DESC(max_mbytes, "Предел полосы USB для видео, �
 #define IT_INT_TXCLKOFF BIT(0)
 #define IT_SYS_STATUS   0x0e
 #define IT_HPD          BIT(6)
+#define IT_RXSENSE      BIT(5)
+#define IT_VID_STABLE   BIT(4)
 #define IT_CLK_BANK     0x0f
 #define IT_PWROFF_TXCLK BIT(4)
 #define IT_PWROFF_RCLK  BIT(6)
@@ -159,6 +162,12 @@ struct alpha_fl {
 	struct mutex i2c_lock;		/* один движок I2C на мост и DDC монитора */
 	u8 bridge;
 	u64 max_bw;			/* байт/с, доступные под видео */
+
+	/* Если IT66121 не подтвердил vid_stable после включения — несколько попыток переподнять вывод. */
+	struct delayed_work lock_work;
+	struct drm_display_mode saved_mode;
+	unsigned int wire_bpp;
+	unsigned int lock_retries;
 
 	/* Кадр в «проводном» формате FL2000, крутится по кругу в NUM_URBS передачах. */
 	u8 *frame;
@@ -963,18 +972,19 @@ static int fl_crtc_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	return drm_atomic_add_affected_planes(state, crtc);
 }
 
-static void fl_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_state *state)
-{
-	struct alpha_fl *fl = to_fl(crtc->dev);
-	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
-	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, &fl->plane);
-	const struct drm_display_mode *m = &cs->adjusted_mode;
-	unsigned int bpp = fl_wire_bpp(fl, m);
-	int idx, ret;
+#define FL_LOCK_RETRIES  3
+#define FL_LOCK_CHECK_MS 300
 
-	if (!drm_dev_enter(crtc->dev, &idx))
-		return;
-	ret = fl_set_mode(fl, m, bpp);
+/*
+ * Настроить PLL/таймингb и поднять поток, затем включить TMDS-выход моста.
+ * @ps — состояние основной плоскости для первого кадра; NULL при повторной
+ * попытке (тогда первый кадр просто берётся из уже имеющегося fl->mirror).
+ */
+static int fl_program_output(struct alpha_fl *fl, const struct drm_display_mode *m,
+			     unsigned int bpp, struct drm_plane_state *ps)
+{
+	int ret = fl_set_mode(fl, m, bpp);
+
 	mutex_lock(&fl->render_lock);
 	if (!ret)
 		ret = fl_stream_alloc(fl, m->hdisplay, m->vdisplay, bpp);
@@ -991,13 +1001,73 @@ static void fl_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_state *state
 	if (!ret)
 		ret = it_enable_output(fl, m->clock);
 	if (ret) {
-		drm_err(&fl->drm, "не удалось включить %dx%d: %d\n", m->hdisplay, m->vdisplay, ret);
 		mutex_lock(&fl->render_lock);
 		fl_stream_stop(fl);
 		mutex_unlock(&fl->render_lock);
+	}
+	return ret;
+}
+
+/*
+ * IT66121 не всегда залочивается с первой попытки (так же ведёт себя и
+ * эталонный драйвер — у него есть такой же ограниченный перезапуск). Если
+ * через FL_LOCK_CHECK_MS после включения vid_stable всё ещё не поднялся,
+ * пробуем переподнять вывод заново, до FL_LOCK_RETRIES раз.
+ */
+static void fl_lock_check(struct work_struct *work)
+{
+	struct alpha_fl *fl = container_of(to_delayed_work(work), struct alpha_fl, lock_work);
+	int idx, ret;
+	u8 sys = 0;
+
+	if (!drm_dev_enter(&fl->drm, &idx))
+		return;
+	if (!atomic_read(&fl->streaming) ||
+	    (!it_read8(fl, IT_SYS_STATUS, &sys) && (sys & IT_VID_STABLE))) {
+		fl->lock_retries = 0;
+		goto out;
+	}
+	if (fl->lock_retries >= FL_LOCK_RETRIES) {
+		drm_err(&fl->drm, "видеосигнал не залочился после %u попыток\n", fl->lock_retries);
+		goto out;
+	}
+	fl->lock_retries++;
+	drm_dbg_kms(&fl->drm, "попытка %u: IT66121 не подтвердил стабильный сигнал, переподнимаю вывод\n",
+		    fl->lock_retries);
+	mutex_lock(&fl->render_lock);
+	fl_stream_stop(fl);
+	mutex_unlock(&fl->render_lock);
+	ret = fl_program_output(fl, &fl->saved_mode, fl->wire_bpp, NULL);
+	if (ret) {
+		drm_err(&fl->drm, "повторное включение не удалось: %d\n", ret);
+		goto out;
+	}
+	schedule_delayed_work(&fl->lock_work, msecs_to_jiffies(FL_LOCK_CHECK_MS));
+out:
+	drm_dev_exit(idx);
+}
+
+static void fl_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_state *state)
+{
+	struct alpha_fl *fl = to_fl(crtc->dev);
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, &fl->plane);
+	const struct drm_display_mode *m = &cs->adjusted_mode;
+	unsigned int bpp = fl_wire_bpp(fl, m);
+	int idx, ret;
+
+	if (!drm_dev_enter(crtc->dev, &idx))
+		return;
+	fl->saved_mode = *m;
+	fl->wire_bpp = bpp;
+	fl->lock_retries = 0;
+	ret = fl_program_output(fl, m, bpp, ps);
+	if (ret) {
+		drm_err(&fl->drm, "не удалось включить %dx%d: %d\n", m->hdisplay, m->vdisplay, ret);
 	} else {
 		drm_info(&fl->drm, "режим %dx%d@%d, %u бит на пиксель\n", m->hdisplay, m->vdisplay,
 			 drm_mode_vrefresh(m), bpp * 8);
+		schedule_delayed_work(&fl->lock_work, msecs_to_jiffies(FL_LOCK_CHECK_MS));
 	}
 	drm_dev_exit(idx);
 }
@@ -1007,6 +1077,7 @@ static void fl_crtc_disable(struct drm_crtc *crtc, struct drm_atomic_state *stat
 	struct alpha_fl *fl = to_fl(crtc->dev);
 	int idx;
 
+	cancel_delayed_work_sync(&fl->lock_work);
 	if (drm_dev_enter(crtc->dev, &idx)) {
 		it_update8(fl, IT_AV_MUTE, IT_AV_MUTE_ON, IT_AV_MUTE_ON);
 		drm_dev_exit(idx);
@@ -1224,7 +1295,7 @@ static ssize_t status_show(struct device *dev, struct device_attribute *attr, ch
 		"it66121 sys %02x hpd %d rxsense %d vid_stable %d\n"
 		"поток %d %ux%u %u байт/пикс\n",
 		a, b, (a >> 10) & 0xffff, (b >> 10) & 0xffff, !!(b & BIT(9)), !!(b & BIT(8)),
-		px, aclk, sys, !!(sys & BIT(6)), !!(sys & BIT(5)), !!(sys & BIT(4)),
+		px, aclk, sys, !!(sys & IT_HPD), !!(sys & IT_RXSENSE), !!(sys & IT_VID_STABLE),
 		atomic_read(&fl->streaming), fl->width, fl->height, fl->bpp);
 	}
 }
@@ -1249,6 +1320,7 @@ static int alpha_fl_probe(struct usb_interface *intf, const struct usb_device_id
 		ret = drmm_mutex_init(&fl->drm, &fl->render_lock);
 	if (ret)
 		return ret;
+	INIT_DELAYED_WORK(&fl->lock_work, fl_lock_check);
 	if (max_mbytes)
 		fl->max_bw = (u64)max_mbytes * 1000000;
 	else if (udev->speed >= USB_SPEED_SUPER)
