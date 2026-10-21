@@ -1,0 +1,25 @@
+# kernel module build artifacts
+*.o
+*.o.cmd
+*.ko
+*.ko.cmd
+*.mod
+*.mod.c
+*.mod.cmd
+*.mod.o
+*.mod.o.cmd
+*.symvers
+*.symvers.cmd
+*.order
+*.order.cmd
+.*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+
+# local dev-only directories (not part of the published driver)
+/reference/
+/vm/
+/build_v2/
+/milestones/
+/logs/
