@@ -66,7 +66,7 @@ direct USB3 port is required.
 
 ```sh
 sudo apt install -y git
-git clone https://github.com/OWNER/alpha-fl2000.git
+git clone https://github.com/vfox888-cpu/alpha-fl2000.git
 cd alpha-fl2000
 sudo ./install.sh
 sudo reboot
@@ -111,7 +111,7 @@ order and check each result before continuing:
 lsusb | grep -i 1d5c:2000                     # adapter present; if missing, ask the user to replug into USB3
 lsusb -t | grep -B2 -A2 5000M                 # adapter should sit on a 5000M (USB3) bus
 mokutil --sb-state                            # if "SecureBoot enabled", explain the MOK enrollment step to the user
-git clone https://github.com/OWNER/alpha-fl2000.git && cd alpha-fl2000
+git clone https://github.com/vfox888-cpu/alpha-fl2000.git && cd alpha-fl2000
 sudo ./install.sh                             # needs the user's sudo password
 dkms status | grep alpha-fl2000               # expect "installed"
 ```
