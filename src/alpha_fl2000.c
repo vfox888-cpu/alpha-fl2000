@@ -165,6 +165,11 @@ struct alpha_fl {
 
 	struct usb_device *udev;
 	struct mutex i2c_lock;		/* один движок I2C на мост и DDC монитора */
+	/*
+	 * Включение/выключение вывода и опрос моста. На время сброса USB (его делает,
+	 * например, usb-storage соседнего интерфейса) держится от pre_reset до post_reset.
+	 */
+	struct mutex hw_lock;
 	u8 bridge;
 	u64 max_bw;			/* байт/с, доступные под видео */
 
@@ -183,6 +188,7 @@ struct alpha_fl {
 	 */
 	struct delayed_work hpd_announce_work;
 	unsigned int hpd_announce_retries;
+	bool hpd_announce_pending;	/* оповещение отложено на время сброса USB */
 
 	/* Кадр в «проводном» формате FL2000, крутится по кругу в NUM_URBS передачах. */
 	u8 *frame;
@@ -578,7 +584,8 @@ static void fl_urb_done(struct urb *urb)
 		dev_err_ratelimited(&fl->udev->dev, "не удалось перезапустить передачу\n");
 }
 
-static void fl_stream_stop(struct alpha_fl *fl)
+/* Остановить передачи, не трогая буферы: копия кадра нужна, чтобы потом продолжить без чёрных дыр. */
+static void fl_stream_pause(struct alpha_fl *fl)
 {
 	unsigned int i;
 
@@ -588,6 +595,13 @@ static void fl_stream_stop(struct alpha_fl *fl)
 		usb_free_urb(fl->urbs[i]);
 		fl->urbs[i] = NULL;
 	}
+}
+
+static void fl_stream_stop(struct alpha_fl *fl)
+{
+	unsigned int i;
+
+	fl_stream_pause(fl);
 	if (fl->frame) {
 		for (i = 0; i < NUM_URBS; i++)
 			sg_free_table(&fl->sgt[i]);
@@ -1000,9 +1014,10 @@ static int fl_crtc_check(struct drm_crtc *crtc, struct drm_atomic_state *state)
 #define FL_HPD_ANNOUNCE_MS      100
 
 /*
- * Настроить PLL/таймингb и поднять поток, затем включить TMDS-выход моста.
+ * Настроить PLL/тайминги и поднять поток, затем включить TMDS-выход моста.
  * @ps — состояние основной плоскости для первого кадра; NULL при повторной
- * попытке (тогда первый кадр просто берётся из уже имеющегося fl->mirror).
+ * попытке и после сброса USB (тогда буферы остаются от паузы и первый кадр
+ * собирается из fl->mirror). Вызывать под hw_lock, поток должен стоять.
  */
 static int fl_program_output(struct alpha_fl *fl, const struct drm_display_mode *m,
 			     unsigned int bpp, struct drm_plane_state *ps)
@@ -1010,7 +1025,10 @@ static int fl_program_output(struct alpha_fl *fl, const struct drm_display_mode 
 	int ret = fl_set_mode(fl, m, bpp);
 
 	mutex_lock(&fl->render_lock);
-	if (!ret)
+	if (!ret && fl->frame && (fl->width != m->hdisplay || fl->height != m->vdisplay ||
+				  fl->bpp != bpp))
+		fl_stream_stop(fl);
+	if (!ret && !fl->frame)
 		ret = fl_stream_alloc(fl, m->hdisplay, m->vdisplay, bpp);
 	if (!ret) {
 		unsigned int nclips;
@@ -1046,6 +1064,7 @@ static void fl_lock_check(struct work_struct *work)
 
 	if (!drm_dev_enter(&fl->drm, &idx))
 		return;
+	mutex_lock(&fl->hw_lock);
 	if (!atomic_read(&fl->streaming) ||
 	    (!it_read8(fl, IT_SYS_STATUS, &sys) && (sys & IT_VID_STABLE))) {
 		fl->lock_retries = 0;
@@ -1059,7 +1078,7 @@ static void fl_lock_check(struct work_struct *work)
 	drm_dbg_kms(&fl->drm, "попытка %u: IT66121 не подтвердил стабильный сигнал, переподнимаю вывод\n",
 		    fl->lock_retries);
 	mutex_lock(&fl->render_lock);
-	fl_stream_stop(fl);
+	fl_stream_pause(fl);
 	mutex_unlock(&fl->render_lock);
 	ret = fl_program_output(fl, &fl->saved_mode, fl->wire_bpp, NULL);
 	if (ret) {
@@ -1068,6 +1087,7 @@ static void fl_lock_check(struct work_struct *work)
 	}
 	schedule_delayed_work(&fl->lock_work, msecs_to_jiffies(FL_LOCK_CHECK_MS));
 out:
+	mutex_unlock(&fl->hw_lock);
 	drm_dev_exit(idx);
 }
 
@@ -1107,6 +1127,7 @@ static void fl_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_state *state
 
 	if (!drm_dev_enter(crtc->dev, &idx))
 		return;
+	mutex_lock(&fl->hw_lock);
 	fl->saved_mode = *m;
 	fl->wire_bpp = bpp;
 	fl->lock_retries = 0;
@@ -1118,6 +1139,7 @@ static void fl_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_state *state
 			 drm_mode_vrefresh(m), bpp * 8);
 		schedule_delayed_work(&fl->lock_work, msecs_to_jiffies(FL_LOCK_CHECK_MS));
 	}
+	mutex_unlock(&fl->hw_lock);
 	drm_dev_exit(idx);
 }
 
@@ -1127,6 +1149,7 @@ static void fl_crtc_disable(struct drm_crtc *crtc, struct drm_atomic_state *stat
 	int idx;
 
 	cancel_delayed_work_sync(&fl->lock_work);
+	mutex_lock(&fl->hw_lock);
 	if (drm_dev_enter(crtc->dev, &idx)) {
 		it_update8(fl, IT_AV_MUTE, IT_AV_MUTE_ON, IT_AV_MUTE_ON);
 		drm_dev_exit(idx);
@@ -1134,6 +1157,7 @@ static void fl_crtc_disable(struct drm_crtc *crtc, struct drm_atomic_state *stat
 	mutex_lock(&fl->render_lock);
 	fl_stream_stop(fl);
 	mutex_unlock(&fl->render_lock);
+	mutex_unlock(&fl->hw_lock);
 }
 
 static const struct drm_crtc_helper_funcs fl_crtc_helper_funcs = {
@@ -1180,9 +1204,13 @@ static int fl_edid_block(void *ctx, u8 *buf, unsigned int block, size_t len)
 static int fl_conn_get_modes(struct drm_connector *c)
 {
 	struct alpha_fl *fl = to_fl(c->dev);
-	const struct drm_edid *edid = drm_edid_read_custom(c, fl_edid_block, fl);
+	const struct drm_edid *edid;
 	int n;
 
+	/* Во время сброса USB I2C не отвечает — подождать, а не терять режимы монитора. */
+	mutex_lock(&fl->hw_lock);
+	edid = drm_edid_read_custom(c, fl_edid_block, fl);
+	mutex_unlock(&fl->hw_lock);
 	drm_edid_connector_update(c, edid);
 	n = drm_edid_connector_add_modes(c);
 	drm_edid_free(edid);
@@ -1198,10 +1226,13 @@ static int fl_conn_detect(struct drm_connector *c, struct drm_modeset_acquire_ct
 
 	if (!drm_dev_enter(c->dev, &idx))
 		return connector_status_disconnected;
+	/* Иначе опрос посреди сброса USB даст «unknown», и GNOME уберёт монитор. */
+	mutex_lock(&fl->hw_lock);
 	if (it_read8(fl, IT_SYS_STATUS, &st))
 		status = connector_status_unknown;
 	else if (st & IT_HPD)
 		status = connector_status_connected;
+	mutex_unlock(&fl->hw_lock);
 	drm_dev_exit(idx);
 	return status;
 }
@@ -1458,6 +1489,8 @@ static int alpha_fl_probe(struct usb_interface *intf, const struct usb_device_id
 	fl->udev = udev;
 	ret = drmm_mutex_init(&fl->drm, &fl->i2c_lock);
 	if (!ret)
+		ret = drmm_mutex_init(&fl->drm, &fl->hw_lock);
+	if (!ret)
 		ret = drmm_mutex_init(&fl->drm, &fl->render_lock);
 	if (ret)
 		return ret;
@@ -1531,6 +1564,59 @@ static void alpha_fl_disconnect(struct usb_interface *intf)
 	mutex_unlock(&fl->render_lock);
 }
 
+/*
+ * Сброс USB всего адаптера. Без этих двух функций usbcore отвязывает драйвер и
+ * подключает заново — у GNOME пропадает и снова появляется видеокарта, и он путается
+ * в мониторах (падал на закрытии крышки). Здесь устройство DRM остаётся на месте:
+ * поток ставится на паузу, после сброса FL2000 и мост настраиваются заново и
+ * вывод поднимается с тем же режимом из копии кадра.
+ */
+static int alpha_fl_pre_reset(struct usb_interface *intf)
+{
+	struct alpha_fl *fl = usb_get_intfdata(intf);
+
+	if (!fl)
+		return 0;
+	cancel_delayed_work_sync(&fl->lock_work);
+	fl->hpd_announce_pending = cancel_delayed_work_sync(&fl->hpd_announce_work);
+	mutex_lock(&fl->hw_lock);	/* отпускается в post_reset */
+	mutex_lock(&fl->render_lock);
+	fl_stream_pause(fl);
+	mutex_unlock(&fl->render_lock);
+	return 0;
+}
+
+static int alpha_fl_post_reset(struct usb_interface *intf)
+{
+	struct alpha_fl *fl = usb_get_intfdata(intf);
+	int ret;
+
+	if (!fl)
+		return 0;
+	ret = fl_ctrl_init(fl->udev);
+	if (!ret)
+		ret = usb_set_interface(fl->udev, FL_IF_AVCONTROL, 1);
+	if (!ret)
+		ret = it_power_on(fl);
+	if (!ret && fl->frame) {
+		fl->lock_retries = 0;
+		ret = fl_program_output(fl, &fl->saved_mode, fl->wire_bpp, NULL);
+		if (!ret)
+			schedule_delayed_work(&fl->lock_work, msecs_to_jiffies(FL_LOCK_CHECK_MS));
+	}
+	mutex_unlock(&fl->hw_lock);
+	if (fl->hpd_announce_pending) {
+		fl->hpd_announce_pending = false;
+		schedule_delayed_work(&fl->hpd_announce_work, msecs_to_jiffies(FL_HPD_ANNOUNCE_MS));
+	}
+	if (ret)
+		drm_err(&fl->drm, "после сброса USB не поднялся: %d, переподключаюсь\n", ret);
+	else
+		drm_info(&fl->drm, "сброс USB пережит, вывод восстановлен\n");
+	/* Ошибка — usbcore отвяжет драйвер и подключит заново, как без этих функций. */
+	return ret;
+}
+
 static const struct usb_device_id alpha_fl_ids[] = {
 	{ USB_DEVICE_INTERFACE_NUMBER(FL_VID, FL_PID, FL_IF_AVCONTROL) },
 	{ }
@@ -1541,6 +1627,8 @@ static struct usb_driver alpha_fl_driver = {
 	.name = KBUILD_MODNAME,
 	.probe = alpha_fl_probe,
 	.disconnect = alpha_fl_disconnect,
+	.pre_reset = alpha_fl_pre_reset,
+	.post_reset = alpha_fl_post_reset,
 	.id_table = alpha_fl_ids,
 };
 module_usb_driver(alpha_fl_driver);

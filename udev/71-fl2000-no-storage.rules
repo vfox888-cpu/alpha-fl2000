@@ -1,0 +1,2 @@
+# Встроенный диск адаптера FL2000 не подключать, даже если usb-storage загрузился раньше modprobe.d (из initramfs).
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTRS{idVendor}=="1d5c", ATTRS{idProduct}=="2000", ATTR{bInterfaceClass}=="08", ATTR{authorized}="0"
