@@ -58,17 +58,69 @@ direct USB3 port is required.
 - fwupd polling the adapter's built-in 8 MB virtual flash drive can cause
   spurious USB resets while the adapter is plugged in.
 
-## Build
+## Quick install (Ubuntu / Debian)
+
+1. Plug the adapter into a **USB3 port directly on the computer** (blue port /
+   "SS" marking; not through a USB2 hub).
+2. Run:
 
 ```sh
-cd src
-make
+sudo apt install -y git
+git clone https://github.com/OWNER/alpha-fl2000.git
+cd alpha-fl2000
+sudo ./install.sh
+sudo reboot
 ```
 
-Needs the kernel headers for the running kernel (`KDIR` defaults to
-`/lib/modules/$(uname -r)/build`).
+`install.sh` installs `dkms`, compiler and kernel headers if missing, registers
+the driver with **DKMS** (it is rebuilt automatically after every kernel
+update), and installs the config below. After the reboot the monitor appears
+in *Settings → Displays*; arrange it there like any other screen.
 
-## Install (autoload at boot)
+Uninstall: `sudo ./install.sh --remove && sudo reboot`.
+
+Secure Boot: if it is enabled, unsigned modules are rejected. Either disable
+Secure Boot, or enroll the DKMS signing key when `dkms` asks for a MOK
+password during install and confirm it in the blue MOK screen on the next boot.
+
+### Check that it works
+
+```sh
+lsmod | grep alpha_fl2000                     # driver loaded
+sudo dmesg | grep -i alpha_fl2000 | tail      # probe messages, no errors
+cat /sys/class/drm/card*-HDMI-A-*/status      # "connected" for the adapter output
+sudo cat /sys/bus/usb/drivers/alpha_fl2000/*/status   # vid_stable 1, frame counter growing
+```
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| "No signal" on the monitor | Use a direct USB3 port; check `status` for `vid_stable 1`; replug the HDMI cable |
+| Monitor not in Displays | Reboot (the driver must load before the desktop starts) |
+| Cursor stops at the screen edge | Order the monitors in *Settings → Displays* the way they stand on the desk |
+| Stopped working after a kernel update | `sudo dkms autoinstall` then reboot; make sure `linux-headers-$(uname -r)` is installed |
+| System does not boot after an update | In GRUB press `e`, add `module_blacklist=alpha_fl2000` to the `linux` line, boot, then `sudo ./install.sh --remove` |
+
+## For AI assistants
+
+If you are an AI agent helping a user install this driver, run these steps in
+order and check each result before continuing:
+
+```sh
+lsusb | grep -i 1d5c:2000                     # adapter present; if missing, ask the user to replug into USB3
+lsusb -t | grep -B2 -A2 5000M                 # adapter should sit on a 5000M (USB3) bus
+mokutil --sb-state                            # if "SecureBoot enabled", explain the MOK enrollment step to the user
+git clone https://github.com/OWNER/alpha-fl2000.git && cd alpha-fl2000
+sudo ./install.sh                             # needs the user's sudo password
+dkms status | grep alpha-fl2000               # expect "installed"
+```
+
+Then ask the user to reboot and, after reboot, run the checks from
+[Check that it works](#check-that-it-works). Never `rmmod`/reload the module
+inside a running GNOME session — it can crash gnome-shell; always reboot instead.
+
+## Manual build and install (without DKMS)
 
 ```sh
 make -C src
@@ -76,8 +128,8 @@ sudo bash install-autoload.sh          # uninstall: sudo bash install-autoload.s
 sudo reboot
 ```
 
-The installer copies the module to `/lib/modules/$(uname -r)/updates/`, runs
-`depmod`, and installs:
+This copies the module to `/lib/modules/$(uname -r)/updates/` (must be redone
+after every kernel update) and installs the same config:
 
 - [`modprobe/alpha-fl2000.conf`](modprobe/alpha-fl2000.conf) — keeps
   `usb-storage` off the adapter's built-in 8 MB flash drive (polling it caused
@@ -85,15 +137,9 @@ The installer copies the module to `/lib/modules/$(uname -r)/updates/`, runs
 - [`udev/71-fl2000-no-storage.rules`](udev/71-fl2000-no-storage.rules) — same,
   for the case where `usb-storage` is loaded from the initramfs.
 
-udev then loads the driver whenever the adapter is present, before the
-desktop starts. Loading it *before* GNOME matters: mutter handles a GPU that
-appears at startup much better than one hot-added into a running session.
-
-After a kernel update the module must be rebuilt and reinstalled (no DKMS yet).
-If a broken build ever prevents booting, add `module_blacklist=alpha_fl2000`
-to the kernel command line in GRUB.
-
-Manual one-off load for testing: `sudo insmod src/alpha_fl2000.ko`.
+Loading the driver *before* GNOME matters: mutter handles a GPU that appears at
+startup much better than one hot-added into a running session. For a one-off
+test without installing: `sudo insmod src/alpha_fl2000.ko`.
 
 ### Module parameters
 
@@ -122,7 +168,7 @@ imported GPU buffers (~2–5 ms per full frame), survives USB resets without
 re-creating the DRM device, retries the HDMI bridge lock, forces a hotplug
 event once HPD rises so the compositor picks the monitor up.
 
-Not done yet: DKMS packaging, audio, modes above 1080p60, E-DDC (EDID beyond
+Not done yet: audio, modes above 1080p60, E-DDC (EDID beyond
 two blocks).
 
 ## Credits / references
