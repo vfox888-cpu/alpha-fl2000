@@ -17,7 +17,16 @@ compositor) sees the adapter as a real GPU/output, not a framebuffer device.
 - ITE IT66121 HDMI transmitter on I2C address `0x4c` (bridge address is
   auto-detected, `0x4d` also probed)
 - Monitor: Xiaomi "Mi Monitor", 1920×1080 @ 50–75 Hz
-- Host: AMD Ryzen + AMD iGPU, kernel 7.0, direct USB3 (SuperSpeed) port
+- Hosts (direct USB3 SuperSpeed port in both cases):
+  - AMD Ryzen + AMD iGPU, kernel 7.0
+  - Lenovo ideapad 330-15IKB: Intel Core i3-7020U + Intel HD Graphics 620
+    (Kaby Lake-U GT2), Ubuntu 26.04.1 LTS, kernel 7.0.0-38-generic,
+    GNOME 50.1 on Wayland, Secure Boot off. Installed via DKMS
+    (`install.sh`); after reboot the module autoloads, binds `1d5c:2000` at
+    5000M instead of `usb-storage`, detects IT66121 @ `0x4c`, the output
+    shows up as `card1-HDMI-A-1: connected` and runs 1920×1080@60. Works with
+    the Intel iGPU as the primary GPU (occasional 35–42 ms full-frame updates
+    show up in `dmesg`)
 
 USB 2.0 ports do not provide enough bandwidth for 1080p raw pixel data — a
 direct USB3 port is required.
