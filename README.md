@@ -10,6 +10,16 @@ Unlike the legacy fbdev-style FL2000 drivers floating around, this is a
 proper atomic **DRM/KMS** driver: GNOME/Wayland (and any other DRM-aware
 compositor) sees the adapter as a real GPU/output, not a framebuffer device.
 
+> [!WARNING]
+> **Do not unplug the adapter while you are logged in to GNOME.** If you do,
+> **reboot (or log out and back in) right after plugging it back.**
+> GNOME (Mutter) does not release a removed USB GPU: after an unplug it keeps
+> a stale entry for it, and from then on the USB monitor stays dark after the
+> screen wakes from sleep/blanking, and a replugged adapter is not picked up
+> (`Failed to hotplug secondary gpu ... device already present`). This is a
+> Mutter limitation, not something the driver can fix. As long as the adapter
+> stays plugged in, sleep/wake works normally.
+
 ## Hardware tested
 
 - Fresco Logic FL2000DX (`1d5c:2000`) — tested on a Hagibis USB-A/USB-C → HDMI
@@ -54,6 +64,15 @@ direct USB3 port is required.
 
 ## Known quirks
 
+- **Hot-unplug in a running GNOME session is not handled by Mutter.** After the
+  adapter is unplugged, gnome-shell keeps the removed GPU in its list. The next
+  wake from screen blanking then never re-enables the USB output (the driver
+  never receives the modeset — no `режим …` line in `dmesg`), and replugging
+  fails with `Failed to hotplug secondary gpu '/dev/dri/cardN': device already
+  present` / `No available CRTC for monitor`. Only a fresh session (reboot or
+  log out/in) clears it. Replugging also gives the connector a new name
+  (e.g. `HDMI-1` → `HDMI-3`), so a saved layout in `~/.config/monitors.xml`
+  may not match until the next reboot.
 - The IT66121's own DDC engine can't be used for EDID on this board: its DDC
   pins share the same I2C bus as FL2000's own DDC/HDCP engine, and the two
   arbitrate for the bus and lose. EDID is instead read directly through
@@ -107,6 +126,7 @@ sudo cat /sys/bus/usb/drivers/alpha_fl2000/*/status   # vid_stable 1, frame coun
 |---|---|
 | "No signal" on the monitor | Use a direct USB3 port; check `status` for `vid_stable 1`; replug the HDMI cable |
 | Monitor not in Displays | Reboot (the driver must load before the desktop starts) |
+| USB monitor stays dark after the screen wakes up, or after replugging the adapter | **Reboot** (or log out and back in). Happens only if the adapter was unplugged during the session — see the warning at the top |
 | Cursor stops at the screen edge | Order the monitors in *Settings → Displays* the way they stand on the desk |
 | Stopped working after a kernel update | `sudo dkms autoinstall` then reboot; make sure `linux-headers-$(uname -r)` is installed |
 | System does not boot after an update | In GRUB press `e`, add `module_blacklist=alpha_fl2000` to the `linux` line, boot, then `sudo ./install.sh --remove` |

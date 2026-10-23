@@ -43,6 +43,12 @@ monitor order is wrong: tell the user to fix it in Settings → Displays
 
 - **Never** `rmmod` / `modprobe -r` / reload the module inside a running
   graphical session — it can crash gnome-shell. Always reboot instead.
+- If the USB monitor stays dark after the screen wakes up or after the adapter
+  was replugged, check `journalctl -b | grep "device already present"`. Tell
+  the user to **reboot** (or log out/in): GNOME keeps a stale entry for an
+  unplugged USB GPU. Warn them not to unplug the adapter during a session.
+  Do not try to fix this in the driver or with `gdctl` — it will fail with
+  `No available CRTC`.
 - Do not edit files under `src/` to "fix" an install problem; report the
   `dmesg` output to the user instead.
 - Uninstall: `sudo ./install.sh --remove`, then reboot.
